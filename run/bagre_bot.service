@@ -1,0 +1,26 @@
+[Unit]
+Description=Bagre Bot Telegram - Downloader Assincrono
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Mude o "User=" para o nome do seu usuario no servidor (ex: root, ubuntu, debian)
+User=root
+# Mude o "Group=" para o grupo principal do servidor
+Group=root
+
+# Caminho completo exato (Absolute Path) de onde voce clonou o /bagre:
+WorkingDirectory=/root/bagre_bot/
+
+# Ele deve rodar o Python de DENTRO do VENV do projeto. Substitua pelo caminho do seu repo:
+ExecStart=/root/bagre_bot/venv/bin/python3 /root/bagre_bot/bagre.py
+
+# Reinicia o Bot magicamente sempre que der crash ou o SV reiniciar:
+Restart=always
+RestartSec=5
+
+# Otimizacoes para evitar buffers nos Logs do kernel
+Environment="PYTHONUNBUFFERED=1"
+
+[Install]
+WantedBy=multi-user.target

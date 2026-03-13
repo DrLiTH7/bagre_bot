@@ -34,26 +34,32 @@ Se você estiver em um ambiente Windows:
 
 ## 🐧 Como Instalar (Linux / Produção Avançada)
 
-Se quiser subir num servidor GNU/Linux limpo:
+Se quiser subir num servidor GNU/Linux (como Ubuntu ou Debian), você não precisa digitar todos os requirimentos na mão. Criei dois arquivos na pasta `run/` preparados para ambientes de servidor:
+
+### 1. Script de Instalação Automática
+Abra o seu terminal na pasta do bot e dê permissão de execução ao script shell que construímos, depois o execute:
 
 ```bash
-# Baixe os requerimentos básicos pro seu Ubuntu/Debian, além do essencial FFmpeg:
-sudo apt update && sudo apt upgrade -y
-sudo apt install python3 python3-pip python3-venv ffmpeg -y
-
-# Dentro da pasta do bot, prepare a VENV
-python3 -m venv venv
-source venv/bin/activate
-
-# Instale os módulos do bot
-pip install -r requirements.txt
-
-# Modifique seu config.py antes de rodar
-nano config.py # Cole o TOKEN aqui!
-
-# Inicie o bote com o pacote de multiplexar janelas virtuais tipo 'screen' ou 'nohup' ou criar um SystemD Service (.service)
-python3 bagre.py
+chmod +x run/install_and_run.sh
+./run/install_and_run.sh
 ```
+O Script pedirá permissão `sudo` para instalar o **FFmpeg** nativo da distro e pacote de VENV caso você não tenha, e vai levantar o bot sozinho logo na sequência.
+
+### 2. Rodando Perpétuo no Fundo (SystemD Daemon)
+Para que o seu bot nunca morra se você fechar o terminal SSH, e reinicie sozinho se o servidor Linux cair (ou atualizar), use o nosso template oficial de SystemD:
+
+1. Edite o arquivo **`run/bagre_bot.service`** colocando os caminhos absolutos corretos de onde você clonou a pasta do bot no seu Linux (Ex: `/home/ubuntu/bagre_bot`), e o seu próprio usuário.
+2. Copie ele para a pasta do sistemas de serviços do Linux:
+   ```bash
+   sudo cp run/bagre_bot.service /etc/systemd/system/
+   ```
+3. Recarregue os serviços e mande ligar:
+   ```bash
+   sudo systemctl daemon-reload
+   sudo systemctl enable bagre_bot  # Faz iniciar com o Boot do Linux
+   sudo systemctl start bagre_bot   # Liga o bot agora
+   ```
+Pronto! Você pode ver os logs ao vivo a qualquer momento digitando: `sudo journalctl -u bagre_bot -f`.
 
 ## ⚠️ Guia FFmpeg (Requisito Especial Exigido pelo Sistema)
 O conversor subjacente `yt-dlp` necessita sumariamente do pacote "FFmpeg" para funcionar correntemente no seu sistema local. Se você roda o script `.bat` do Windows e o bot ignora o link gerando uns logs vermelhos sobre FFMPEG não encontrado, você precisará instalar isso:
