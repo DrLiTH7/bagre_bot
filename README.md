@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 <div align="center">
   <h1>🐟 Bagre Bot</h1>
   <p>Um bot que atua como um YouTube Downloader assíncrono, desenvolvido em Python.</p>
@@ -79,3 +80,7 @@ Se você deseja que o bot inicie automaticamente com o seu computador de forma i
 4. Na aba de Ação escolha "Iniciar um programa".
 5. Em Programa/script, clique em *Procurar* e selecione o arquivo **`q_start.vbs`** localizado na sua pasta de execução (ex: `C:\Users\Fingolfin\Documents\Projetos\bagre\run\q_start.vbs`).
 6. Conclua a tarefa. O seu bot agora acordará silenciosamente na bandeja do sistema sempre que você acessar seu usuário no PC!
+=======
+# bagre_bot
+Youtube audio downloader bot for Telegram
+>>>>>>> origin/main
