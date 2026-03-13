@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 <div align="center">
   <h1>🐟 Bagre Bot</h1>
   <p>Um bot que atua como um YouTube Downloader assíncrono, desenvolvido em Python.</p>
@@ -83,4 +82,3 @@ Se você deseja que o bot inicie automaticamente com o seu computador de forma i
 =======
 # bagre_bot
 Youtube audio downloader bot for Telegram
->>>>>>> origin/main
