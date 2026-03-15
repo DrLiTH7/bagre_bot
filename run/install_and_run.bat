@@ -6,6 +6,9 @@ echo        INSTALADOR E INICIADOR: BAGRE BOT
 echo ==============================================
 echo.
 
+:: Muda o diretorio de trabalho para a raiz do projeto (um nivel acima de 'run')
+cd ..
+
 :: Verifica se o Python esta instalado
 python --version >nul 2>&1
 if %errorlevel% neq 0 (
