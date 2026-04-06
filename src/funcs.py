@@ -10,15 +10,24 @@ import shutil
 import time
 import tempfile
 import threading
+import io
 import itertools
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 from queue import PriorityQueue
+import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext, CallbackQueryHandler
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 
-# Fila de downloads global para gerenciar prioridades (Nível 1 = Single, Nível 2 = Playlist)
-download_queue = PriorityQueue()
-queue_counter = itertools.count()  # Empate: contador sequencial garante FIFO e evita erro de dict < dict
+# Fila de downloads assíncrona para gerenciar prioridades
+download_queue = None
+
+def get_queue():
+    global download_queue
+    if download_queue is None:
+        download_queue = asyncio.PriorityQueue()
+    return download_queue
+
+queue_counter = itertools.count()  # Empate: contador sequencial garante FIFO
 
 # Dicionário para links de playlists: guarda dict com 'url', 'time' e 'msg_id'
 url_cache = {}
@@ -45,14 +54,12 @@ YTDLP_LOGGER = logging.getLogger('yt_dlp')
 
 # --- FUNÇÕES AUXILIARES ---
 
-def prepare_telegram_thumb(input_path):
-    """Corta a imagem para 1:1, redimensiona para 320x320 e salva como JPG leve."""
-    output_path = "thumb_final.jpg"
+def prepare_telegram_thumb(input_bytes_io):
+    """Corta a imagem para 1:1, redimensiona para 320x320 e salva num buffer JPG na memória."""
+    if not input_bytes_io:
+        return None
     try:
-        if not os.path.exists(input_path):
-            return None
-            
-        with Image.open(input_path) as img:
+        with Image.open(input_bytes_io) as img:
             img = img.convert("RGB")
             
             # Corta a imagem para ser quadrada
@@ -62,11 +69,13 @@ def prepare_telegram_thumb(input_path):
             top = (height - min_dim) / 2
             img = img.crop((left, top, left + min_dim, top + min_dim))
             
-            # Redimensiona para 320x320e salva
+            # Redimensiona para 320x320 e salva
             img.thumbnail((320, 320))
-            img.save(output_path, "JPEG", quality=100)
-            
-        return output_path
+            output_io = io.BytesIO()
+            img.save(output_io, "JPEG", quality=50, optimize=True)
+            output_io.seek(0)
+            output_io.name = "thumb_final.jpg"
+            return output_io
     except Exception as e:
         logger.error(f"Erro no Pillow: {e}")
         return None
@@ -90,29 +99,70 @@ def clean_youtube_url(url: str) -> str:
     new_query = urlencode(query_params, doseq=True)
     return urlunparse(parsed_url._replace(query=new_query))
 
-def worker_download():
-    """Thread em background que processa a PriorityQueue infinitamente."""
+def fetch_yt_audio(url: str):
+    """Executa a extração síncrona do urllib e do yt-dlp. Rodará no ThreadPool via asyncio.to_thread."""
+    ydl_opts = {
+        'format': 'm4a/bestaudio/best',
+        'quiet': True,
+        'noplaylist': True,
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+        video_title = info.get('title', 'audio')
+        sanitized_title = sanitize_filename(video_title)
+        direct_url = info.get('url')
+        headers = info.get('http_headers', {})
+
+    if not direct_url:
+        raise ValueError("Não consegui achar o link direto de stream do YouTube.")
+
+    import urllib.request
+    req = urllib.request.Request(direct_url, headers=headers)
+    audio_buffer = io.BytesIO()
+    with urllib.request.urlopen(req) as response:
+        audio_buffer.write(response.read())
+    
+    audio_buffer.seek(0)
+    audio_buffer.name = f"{sanitized_title}.m4a"
+
+    thumb_buffer = None
+    thumbnails = info.get('thumbnails', [])
+    if thumbnails:
+        best_thumb_url = thumbnails[-1].get('url')
+        if best_thumb_url:
+            thumb_req = urllib.request.Request(best_thumb_url, headers=headers)
+            try:
+                with urllib.request.urlopen(thumb_req) as t_resp:
+                    raw_thumb_buffer = io.BytesIO(t_resp.read())
+                    thumb_buffer = prepare_telegram_thumb(raw_thumb_buffer)
+            except Exception as e:
+                logger.error(f"Erro ao processar thumbnail em memória: {e}")
+                
+    return audio_buffer, thumb_buffer, video_title, info
+    
+async def worker_download():
+    """Tarefa assíncrona que consome a fila nativamente."""
+    queue = get_queue()
     while True:
         try:
-            # Pega o próximo item pela prioridade (menor número = maior prioridade)
-            priority, count, item_data = download_queue.get()
+            priority, count, item_data = await queue.get()
             
             url = item_data['url']
             update = item_data['update']
             context = item_data['context']
             is_playlist_item = item_data['is_playlist_item']
             user_message_id = item_data.get('user_message_id')
-            query_message_id = item_data.get('query_message_id')  # ID da msg do bot pra apagar depois
+            query_message_id = item_data.get('query_message_id')
             
-            _process_download(url, update, context, is_playlist_item, user_message_id, query_message_id)
+            await _process_download(url, update, context, is_playlist_item, user_message_id, query_message_id)
             
         except Exception as e:
             logger.error(f"Erro no worker: {e}")
         finally:
-            download_queue.task_done()
+            queue.task_done()
 
-def _process_download(url: str, update: Update, context: CallbackContext, is_playlist_item=False, user_message_id=None, query_message_id=None):
-    # A implementação pesada original que baixa e manda o audio.
+async def _process_download(url: str, update: Update, context: ContextTypes.DEFAULT_TYPE, is_playlist_item=False, user_message_id=None, query_message_id=None):
+    # Processamento 100% em memória usando io.BytesIO via hooks NATIVOS
     chat_id = update.effective_chat.id
     status_message = None
 
@@ -121,126 +171,58 @@ def _process_download(url: str, update: Update, context: CallbackContext, is_pla
              status_message = type('Object', (), {'message_id': query_message_id})()
         elif not is_playlist_item:
             try:
-                status_message = context.bot.send_message(chat_id=chat_id, text="⏳ Xo vê aqui...")
+                status_message = await context.bot.send_message(chat_id=chat_id, text="⏳ Xo vê aqui...")
             except:
                 pass
 
-        # Cria um diretório temporário para este download específico
-        with tempfile.TemporaryDirectory() as temp_dir:
-            # 1. Extrai informações e define nomes
-            with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
-                info = ydl.extract_info(url, download=False)
-                video_title = info.get('title', 'audio')
-                sanitized_title = sanitize_filename(video_title)
-                final_audio_path = os.path.join(temp_dir, f"{sanitized_title}.m4a")
+        if status_message:
+            await context.bot.edit_message_text(chat_id=chat_id, message_id=status_message.message_id, text=f"📥 Blz, puxando o áudio...")
 
+        # Envia o fetch pesado pro background
+        try:
+            audio_buffer, thumb_buffer, video_title, info = await asyncio.to_thread(fetch_yt_audio, url)
+        except Exception as e:
             if status_message:
-                context.bot.edit_message_text(chat_id=chat_id, message_id=status_message.message_id, text=f"📥 Blz, baixando: {video_title}")
+                await context.bot.edit_message_text(chat_id=chat_id, message_id=status_message.message_id, text="❌ Ocorreu um erro baixando. Talvez protegido ou geofenced.")
+            return
 
-            # 2. Configurações de alta velocidade do yt-dlp
-            ydl_opts = {
-                'format': 'm4a/bestaudio/best', # Tenta baixar em M4A.
-                'writethumbnail': False,
-                'ignoreerrors': True,
-                'postprocessors': [{
-                    'key': 'FFmpegExtractAudio',
-                    'preferredcodec': 'm4a',
-                    'preferredquality': '192',
-                }],
-                'outtmpl': os.path.join(temp_dir, f'{sanitized_title}.%(ext)s'),
-                'noplaylist': True,
-            }
+        if status_message:
+            await context.bot.edit_message_text(chat_id=chat_id, message_id=status_message.message_id, text=f"📦 Baixando para a RAM: {video_title}\n🚀 To mandando aqui...")
 
-            # Baixa o áudio
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([url])
+        # 4. Envio do Áudio
+        caption_text = f"<b>🎧 {video_title}</b>\n👤 <code>{info.get('uploader')}</code>\n\n🔗 <a href='{url}'>Link Original</a>"
 
-            # Baixa a Thumbnail
-            thumb_original = None
-            thumb_pronta = None
-            try:
-                thumbnails = info.get('thumbnails', [])
-                if thumbnails:
-                    best_thumb_url = thumbnails[-1].get('url')
-                    if best_thumb_url:
-                        ext = best_thumb_url.split('.')[-1].split('?')[0]
-                        if not ext.isalpha(): ext = "jpg"
-                        
-                        import urllib.request
-                        thumb_original = os.path.join(temp_dir, f"thumb_manual.{ext}")
-                        urllib.request.urlretrieve(best_thumb_url, thumb_original)
-            except Exception as e:
-                logger.error(f"Erro ao baixar thumb manualmente: {e}")
+        await context.bot.send_audio(
+            chat_id=chat_id,
+            audio=audio_buffer,
+            caption=caption_text,
+            parse_mode='HTML',
+            title=video_title,
+            performer=info.get('uploader'),
+            duration=int(info.get('duration', 0)),
+            thumb=thumb_buffer,
+            read_timeout=180,
+            write_timeout=180,
+            connect_timeout=180
+        )
 
-            # 4. CHECKER da Thumbnail
-            if thumb_original:
-                if thumb_original.lower().endswith(('.jpg', '.jpeg')):
-                    thumb_pronta = os.path.join(temp_dir, "thumb_final.jpg")
-                    shutil.copy(thumb_original, thumb_pronta)
-                    logger.info("Thumb já era JPG, apenas copiada.")
-                else:
-                    current_dir = os.getcwd()
-                    os.chdir(temp_dir)
-                    try:
-                        thumb_basename = prepare_telegram_thumb(os.path.basename(thumb_original))
-                        if thumb_basename:
-                           thumb_pronta = os.path.join(temp_dir, thumb_basename)
-                    finally:
-                        os.chdir(current_dir)
-                    logger.info("Thumb convertida via Pillow.")
-
-            if not os.path.exists(final_audio_path):
-                # Fallback caso o yt-dlp tenha salvo como mp3 ou webm
-                fallback_path = final_audio_path.replace(".m4a", ".mp3")
-                if os.path.exists(fallback_path):
-                    final_audio_path = fallback_path
-                else:
-                    raise FileNotFoundError(f"O arquivo de Áudio não foi criado no disco: {final_audio_path}")
-
-            if status_message:
-                context.bot.edit_message_text(chat_id=chat_id, message_id=status_message.message_id, text="🚀 To mandando aqui...")
-
-            # 5. Envio do Áudio
-            caption_text = f"<b>🎧 {video_title}</b>\n👤 <code>{info.get('uploader')}</code>\n\n🔗 <a href='{url}'>Link Original</a>"
-
-            with open(final_audio_path, 'rb') as audio_file:
-                thumb_handle = None
-                if thumb_pronta and os.path.exists(thumb_pronta):
-                    thumb_handle = open(thumb_pronta, 'rb')
-                
-                context.bot.send_audio(
-                    chat_id=chat_id,
-                    audio=audio_file,
-                    caption=caption_text,
-                    parse_mode='HTML',
-                    title=video_title,
-                    performer=info.get('uploader'),
-                    duration=int(info.get('duration', 0)),
-                    thumb=thumb_handle,
-                    timeout=180
-                )
-                if thumb_handle:
-                    thumb_handle.close()
-
-            if status_message:
-                context.bot.delete_message(chat_id=chat_id, message_id=status_message.message_id)
+        if status_message:
+            await context.bot.delete_message(chat_id=chat_id, message_id=status_message.message_id)
 
     except Exception as e:
-        logger.error(f"Erro: {e}")
+        logger.error(f"Erro crítico assíncrono: {e}")
 
     finally:
-        # 6. LIMPEZA TOTAL
-        
         if user_message_id:
-            try: context.bot.delete_message(chat_id=chat_id, message_id=user_message_id)
+            try: await context.bot.delete_message(chat_id=chat_id, message_id=user_message_id)
             except: pass
 
 # --- O RESTO DO CÓDIGO (START, HANDLE_MESSAGE, BUTTON_CALLBACK, MAIN) MANTIDO IGUAL ---
 
-def start(update: Update, context: CallbackContext) -> None:
-    update.message.reply_html(f"Quié?, {update.effective_user.mention_html()}!\n\nManda um link do YouTube.")
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_html(f"Quié?, {update.effective_user.mention_html()}!\n\nManda um link do YouTube.")
 
-def handle_message(update: Update, context: CallbackContext) -> None:
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message_text = update.message.text.strip()
     if is_youtube_url(message_text) and len(message_text.split()) == 1:
         clean_url_cache()  # Limpa links vehlos a cada nova mensagem
@@ -251,11 +233,12 @@ def handle_message(update: Update, context: CallbackContext) -> None:
                 [InlineKeyboardButton("🎵 Baixar só esse vídeo", callback_data=f"single|{link_id}")],
                 [InlineKeyboardButton("🎶 Baixar a playlist toda", callback_data=f"playlist|{link_id}")],
             ]
-            update.message.reply_text('Link de playlist. Quer o que meu fi?', reply_markup=InlineKeyboardMarkup(keyboard))
+            await update.message.reply_text('Link de playlist. Quer o que meu fi?', reply_markup=InlineKeyboardMarkup(keyboard))
         else:
             # É vídeo normal
             url_limpa = clean_youtube_url(message_text)
-            download_queue.put((1, next(queue_counter), {
+            queue = get_queue()
+            await queue.put((1, next(queue_counter), {
                 'url': url_limpa,
                 'update': update,
                 'context': context,
@@ -264,9 +247,14 @@ def handle_message(update: Update, context: CallbackContext) -> None:
                 'query_message_id': None
             }))
 
-def button_callback(update: Update, context: CallbackContext) -> None:
+def fetch_yt_playlist(url: str):
+    with yt_dlp.YoutubeDL({'extract_flat': 'in_playlist', 'quiet': True, 'noplaylist': False}) as ydl:
+        info = ydl.extract_info(url, download=False)
+        return info.get('entries', [])
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    query.answer()
+    await query.answer()
     
     action, data_id = query.data.split('|', 1)
     url_data = url_cache.get(data_id)
@@ -274,9 +262,9 @@ def button_callback(update: Update, context: CallbackContext) -> None:
     
     if not url:
         if query.message:
-            query.edit_message_text(text="❌ Deu erro aqui k, o link expirou.")
+            await query.edit_message_text(text="❌ Deu erro aqui k, o link expirou.")
         else:
-            context.bot.send_message(chat_id=query.from_user.id, text="❌ O link expirou, tente mandar de novo pra ver se vai k")
+            await context.bot.send_message(chat_id=query.from_user.id, text="❌ O link expirou, tente mandar de novo pra ver se vai k")
         return
 
     # Se query.message é None, o clique veio do modo Inline
@@ -300,14 +288,15 @@ def button_callback(update: Update, context: CallbackContext) -> None:
     if action == 'single':
         query_msg_id = None
         if query.message:
-            query.edit_message_text(text="Tá, baixar só esse aí...")
+            await query.edit_message_text(text="Tá, baixar só esse aí...")
             query_msg_id = query.message.message_id
         else:
-            msg = context.bot.send_message(chat_id=target_chat_id, text="🚀 Xo botar esse na frente aqui...")
+            msg = await context.bot.send_message(chat_id=target_chat_id, text="🚀 Xo botar esse na frente aqui...")
             query_msg_id = msg.message_id
         
         url_limpa = clean_youtube_url(url)
-        download_queue.put((1, next(queue_counter), {
+        queue = get_queue()
+        await queue.put((1, next(queue_counter), {
             'url': url_limpa,
             'update': fake_update,
             'context': context,
@@ -318,43 +307,41 @@ def button_callback(update: Update, context: CallbackContext) -> None:
     
     elif action == 'playlist':
         if query.message:
-            query.edit_message_text(text="🤖 Ok, vou fuçar aqui essa playlist. Guenta que eu vou mandando")
+            await query.edit_message_text(text="🤖 Ok, vou fuçar aqui essa playlist. Guenta que eu vou mandando")
             # Em playlist deleta o comando de link da URL
             if url_data.get('msg_id'):
-                try: context.bot.delete_message(chat_id=target_chat_id, message_id=url_data.get('msg_id'))
+                try: await context.bot.delete_message(chat_id=target_chat_id, message_id=url_data.get('msg_id'))
                 except: pass
         else:
-            context.bot.send_message(chat_id=target_chat_id, text="🤖 Extraindo a playlist...")
+            await context.bot.send_message(chat_id=target_chat_id, text="🤖 Extraindo a playlist...")
 
         # Roda a extração crua na fila Nível 2
         try:
-            with yt_dlp.YoutubeDL({'extract_flat': 'in_playlist', 'quiet': True, 'noplaylist': False}) as ydl:
-                info = ydl.extract_info(url, download=False)
-                entries = info.get('entries', [])
+            entries = await asyncio.to_thread(fetch_yt_playlist, url)
+            if entries:
+                queue = get_queue()
+                for entry in entries:
+                    video_url = entry.get('url')
+                    if video_url:
+                        # Adiciona na fila de playlist com prioridade 2
+                        await queue.put((2, next(queue_counter), {
+                            'url': video_url,
+                            'update': fake_update,
+                            'context': context,
+                            'is_playlist_item': True,
+                            'user_message_id': None,
+                            'query_message_id': None
+                        }))
                 
-                if entries:
-                    for entry in entries:
-                        video_url = entry.get('url')
-                        if video_url:
-                            # Adiciona na fila de playlist com prioridade 2
-                            download_queue.put((2, next(queue_counter), {
-                                'url': video_url,
-                                'update': fake_update,
-                                'context': context,
-                                'is_playlist_item': True,
-                                'user_message_id': None,
-                                'query_message_id': None
-                            }))
-                    
-                    if query.message:
-                        query.edit_message_text(text=f"📥 {len(entries)} músicas entraram na fila. Vai indo de pouquin")
-                    else:
-                        context.bot.send_message(chat_id=target_chat_id, text=f"📥 {len(entries)} músicas prontas para baixar. Vai indo de pouquin")
+                if query.message:
+                    await query.edit_message_text(text=f"📥 {len(entries)} músicas entraram na fila. Vai indo de pouquin")
                 else:
-                    context.bot.send_message(chat_id=target_chat_id, text="Tem pora ninhuma nessa playlist k")
+                    await context.bot.send_message(chat_id=target_chat_id, text=f"📥 {len(entries)} músicas prontas para baixar. Vai indo de pouquin")
+            else:
+                await context.bot.send_message(chat_id=target_chat_id, text="Tem pora ninhuma nessa playlist k")
         except Exception as e:
             logger.error(f"Erro ao extrair playlist: {e}")
-            context.bot.send_message(chat_id=target_chat_id, text="❌ Vish, deu um problema pra ler essa playlist")
+            await context.bot.send_message(chat_id=target_chat_id, text="❌ Vish, deu um problema pra ler essa playlist")
 
     # Após o uso (seja single ou playlist), descarta o cache daquele botão para não ser reutilizado ou ocupar memória.
     if data_id in url_cache:

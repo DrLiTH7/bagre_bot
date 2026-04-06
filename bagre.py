@@ -1,21 +1,29 @@
-import threading
-from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackQueryHandler
+import asyncio
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, CallbackQueryHandler
 from config import TELEGRAM_TOKEN
 from src.funcs import start, handle_message, button_callback, worker_download
 
-def main() -> None:
-    # 1. Inicia Workers em Background (Pool de Threads) para consumir a PriorityQueue simultaneamente
+async def post_init(application):
+    # Inicia Workers em Background nativos do asyncio, atrelados ao event loop principal do bot
     for _ in range(4):
-        worker_thread = threading.Thread(target=worker_download, daemon=True)
-        worker_thread.start()
+        asyncio.create_task(worker_download())
 
-    updater = Updater(TELEGRAM_TOKEN, request_kwargs={'read_timeout': 10, 'connect_timeout': 10})
-    dp = updater.dispatcher
-    dp.add_handler(CommandHandler("start", start, run_async=True))
-    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message, run_async=True))
-    dp.add_handler(CallbackQueryHandler(button_callback, run_async=True))
-    updater.start_polling()
-    updater.idle()
+def main() -> None:
+    application = (
+        ApplicationBuilder()
+        .token(TELEGRAM_TOKEN)
+        .post_init(post_init)
+        .read_timeout(10)
+        .connect_timeout(10)
+        .job_queue(None)
+        .build()
+    )
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(CallbackQueryHandler(button_callback))
+    
+    application.run_polling()
 
 if __name__ == '__main__':
     main()
