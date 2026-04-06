@@ -99,45 +99,66 @@ def clean_youtube_url(url: str) -> str:
     new_query = urlencode(query_params, doseq=True)
     return urlunparse(parsed_url._replace(query=new_query))
 
+def _aria2c_available() -> bool:
+    """Verifica se o aria2c está disponível no PATH do sistema."""
+    import shutil
+    return shutil.which('aria2c') is not None
+
 def fetch_yt_audio(url: str):
-    """Executa a extração síncrona do urllib e do yt-dlp. Rodará no ThreadPool via asyncio.to_thread."""
-    ydl_opts = {
-        'format': 'm4a/bestaudio/best',
-        'quiet': True,
-        'noplaylist': True,
-    }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
+    """Deixa o yt-dlp baixar internamente (chunks paralelos) e lê para BytesIO.
+    Usa tempfile apenas como ponte—tudo fica na RAM após a leitura."""
+    import tempfile, os, glob, urllib.request
+
+    with tempfile.TemporaryDirectory() as tmp:
+        use_aria2c = _aria2c_available()
+        ydl_opts = {
+            'format': 'm4a/bestaudio/best',
+            'quiet': True,
+            'noplaylist': True,
+            'outtmpl': os.path.join(tmp, '%(title)s.%(ext)s'),
+        }
+        if use_aria2c:
+            # aria2c: 16 conexões paralelas ao CDN — mitiga throttling do YouTube
+            ydl_opts['external_downloader'] = 'aria2c'
+            ydl_opts['external_downloader_args'] = ['-x', '16', '-s', '16', '-k', '1M']
+            logger.info("Usando aria2c para download (16 conexões).")
+        else:
+            ydl_opts['concurrent_fragment_downloads'] = 4
+            logger.info("aria2c não encontrado, usando downloader interno do yt-dlp.")
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+
         video_title = info.get('title', 'audio')
         sanitized_title = sanitize_filename(video_title)
-        direct_url = info.get('url')
-        headers = info.get('http_headers', {})
 
-    if not direct_url:
-        raise ValueError("Não consegui achar o link direto de stream do YouTube.")
+        files = glob.glob(os.path.join(tmp, '*'))
+        if not files:
+            raise FileNotFoundError("yt-dlp não gerou nenhum arquivo.")
+        audio_path = files[0]
 
-    import urllib.request
-    req = urllib.request.Request(direct_url, headers=headers)
-    audio_buffer = io.BytesIO()
-    with urllib.request.urlopen(req) as response:
-        audio_buffer.write(response.read())
-    
-    audio_buffer.seek(0)
-    audio_buffer.name = f"{sanitized_title}.m4a"
+        # Lê para BytesIO — a partir daqui tudo fica na RAM
+        audio_buffer = io.BytesIO()
+        with open(audio_path, 'rb') as f:
+            audio_buffer.write(f.read())
+        audio_buffer.seek(0)
+        ext = os.path.splitext(audio_path)[1] or '.m4a'
+        audio_buffer.name = f"{sanitized_title}{ext}"
 
+    # Thumbnail via urllib (arquivo pequeno, sequencial ok)
     thumb_buffer = None
     thumbnails = info.get('thumbnails', [])
     if thumbnails:
         best_thumb_url = thumbnails[-1].get('url')
         if best_thumb_url:
-            thumb_req = urllib.request.Request(best_thumb_url, headers=headers)
             try:
+                headers = info.get('http_headers', {})
+                thumb_req = urllib.request.Request(best_thumb_url, headers=headers)
                 with urllib.request.urlopen(thumb_req) as t_resp:
                     raw_thumb_buffer = io.BytesIO(t_resp.read())
                     thumb_buffer = prepare_telegram_thumb(raw_thumb_buffer)
             except Exception as e:
                 logger.error(f"Erro ao processar thumbnail em memória: {e}")
-                
+
     return audio_buffer, thumb_buffer, video_title, info
     
 async def worker_download():
@@ -176,18 +197,18 @@ async def _process_download(url: str, update: Update, context: ContextTypes.DEFA
                 pass
 
         if status_message:
-            await context.bot.edit_message_text(chat_id=chat_id, message_id=status_message.message_id, text=f"📥 Blz, puxando o áudio...")
+            await context.bot.edit_message_text(chat_id=chat_id, message_id=status_message.message_id, text=f"📥 Blz, baixando aqui...")
 
         # Envia o fetch pesado pro background
         try:
             audio_buffer, thumb_buffer, video_title, info = await asyncio.to_thread(fetch_yt_audio, url)
         except Exception as e:
             if status_message:
-                await context.bot.edit_message_text(chat_id=chat_id, message_id=status_message.message_id, text="❌ Ocorreu um erro baixando. Talvez protegido ou geofenced.")
+                await context.bot.edit_message_text(chat_id=chat_id, message_id=status_message.message_id, text="❌ Deu erro aqui k, acho que isso ta bloqueado")
             return
 
         if status_message:
-            await context.bot.edit_message_text(chat_id=chat_id, message_id=status_message.message_id, text=f"📦 Baixando para a RAM: {video_title}\n🚀 To mandando aqui...")
+            await context.bot.edit_message_text(chat_id=chat_id, message_id=status_message.message_id, text=f"📦 {video_title}\n🚀 To mandando aqui...")
 
         # 4. Envio do Áudio
         caption_text = f"<b>🎧 {video_title}</b>\n👤 <code>{info.get('uploader')}</code>\n\n🔗 <a href='{url}'>Link Original</a>"
@@ -200,7 +221,7 @@ async def _process_download(url: str, update: Update, context: ContextTypes.DEFA
             title=video_title,
             performer=info.get('uploader'),
             duration=int(info.get('duration', 0)),
-            thumb=thumb_buffer,
+            thumbnail=thumb_buffer,
             read_timeout=180,
             write_timeout=180,
             connect_timeout=180
@@ -264,7 +285,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if query.message:
             await query.edit_message_text(text="❌ Deu erro aqui k, o link expirou.")
         else:
-            await context.bot.send_message(chat_id=query.from_user.id, text="❌ O link expirou, tente mandar de novo pra ver se vai k")
+            await context.bot.send_message(chat_id=query.from_user.id, text="❌ O link expirou, tenta mandar de novo pra ver se vai k")
         return
 
     # Se query.message é None, o clique veio do modo Inline
@@ -307,7 +328,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     
     elif action == 'playlist':
         if query.message:
-            await query.edit_message_text(text="🤖 Ok, vou fuçar aqui essa playlist. Guenta que eu vou mandando")
+            await query.edit_message_text(text="🤖 Ok, vou fuçar aqui essa playlist. Guenta aí que eu vou mandando")
             # Em playlist deleta o comando de link da URL
             if url_data.get('msg_id'):
                 try: await context.bot.delete_message(chat_id=target_chat_id, message_id=url_data.get('msg_id'))

@@ -23,7 +23,7 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(CallbackQueryHandler(button_callback))
     
-    application.run_polling()
+    application.run_polling(poll_interval=0, timeout=30)
 
 if __name__ == '__main__':
     main()
