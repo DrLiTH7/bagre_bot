@@ -3,10 +3,13 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, fil
 from config import TELEGRAM_TOKEN
 from src.funcs import start, handle_message, button_callback, worker_download
 
+_worker_tasks = []
+
 async def post_init(application):
-    # Inicia Workers em Background nativos do asyncio, atrelados ao event loop principal do bot
+    # Mantém referência das tasks para evitar coleta pelo garbage collector
     for _ in range(4):
-        asyncio.create_task(worker_download())
+        task = asyncio.create_task(worker_download())
+        _worker_tasks.append(task)
 
 def main() -> None:
     application = (

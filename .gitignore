@@ -1,0 +1,24 @@
+# Dependências
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Configuração sensível
+.env
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+
+# Build
+dist/
+build/
+*.egg-info/

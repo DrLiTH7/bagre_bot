@@ -24,7 +24,7 @@ download_queue = None
 def get_queue():
     global download_queue
     if download_queue is None:
-        download_queue = asyncio.PriorityQueue()
+        download_queue = asyncio.PriorityQueue(maxsize=200)
     return download_queue
 
 queue_counter = itertools.count()  # Empate: contador sequencial garante FIFO
@@ -199,9 +199,16 @@ async def _process_download(url: str, update: Update, context: ContextTypes.DEFA
         if status_message:
             await context.bot.edit_message_text(chat_id=chat_id, message_id=status_message.message_id, text=f"📥 Blz, baixando aqui...")
 
-        # Envia o fetch pesado pro background
+        # Envia o fetch pesado pro background (timeout de 5 minutos)
         try:
-            audio_buffer, thumb_buffer, video_title, info = await asyncio.to_thread(fetch_yt_audio, url)
+            audio_buffer, thumb_buffer, video_title, info = await asyncio.wait_for(
+                asyncio.to_thread(fetch_yt_audio, url),
+                timeout=300
+            )
+        except asyncio.TimeoutError:
+            if status_message:
+                await context.bot.edit_message_text(chat_id=chat_id, message_id=status_message.message_id, text="❌ Demorou demais, desisti k")
+            return
         except Exception as e:
             if status_message:
                 await context.bot.edit_message_text(chat_id=chat_id, message_id=status_message.message_id, text="❌ Deu erro aqui k, acho que isso ta bloqueado")

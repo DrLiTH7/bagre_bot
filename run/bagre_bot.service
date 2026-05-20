@@ -4,16 +4,17 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-# Mude o "User=" para o nome do seu usuario no servidor (ex: root, ubuntu, debian)
-User=root
-# Mude o "Group=" para o grupo principal do servidor
-Group=root
+# Recomendado: crie um usuário dedicado em vez de rodar como root.
+# sudo useradd -r -s /bin/false bagre
+# sudo chown -R bagre:bagre /opt/bagre_bot
+User=bagre
+Group=bagre
 
 # Caminho completo exato (Absolute Path) de onde voce clonou o /bagre:
-WorkingDirectory=/root/bagre_bot/
+WorkingDirectory=/opt/bagre_bot/
 
 # Ele deve rodar o Python de DENTRO do VENV do projeto. Substitua pelo caminho do seu repo:
-ExecStart=/root/bagre_bot/venv/bin/python3 /root/bagre_bot/bagre.py
+ExecStart=/opt/bagre_bot/venv/bin/python3 /opt/bagre_bot/bagre.py
 
 # Reinicia o Bot magicamente sempre que der crash ou o SV reiniciar:
 Restart=always
