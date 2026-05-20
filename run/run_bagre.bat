@@ -1,3 +1,3 @@
 @echo off
-cd /d "C:\bagre"
+cd /d "%~dp0.."
 "venv\Scripts\pythonw.exe" "bagre.py"
